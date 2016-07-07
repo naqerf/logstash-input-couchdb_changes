@@ -68,6 +68,9 @@ class LogStash::Inputs::CouchDBChanges < LogStash::Inputs::Base
   # output.
   config :keep_revision, :validate => :boolean, :default => false
 
+  # Preserve the document contents in the output when "deleted"
+  config :keep_deleted_doc, :validate => :boolean, :default => false
+
   # Future feature! Until implemented, changing this from the default
   # will not do anything.
   #
@@ -203,6 +206,11 @@ class LogStash::Inputs::CouchDBChanges < LogStash::Inputs::Base
     hash['@metadata'] = { '_id' => line['doc']['_id'] }
     if line['doc']['_deleted']
       hash['@metadata']['action'] = 'delete'
+      if @keep_deleted_doc
+        hash['doc'] = line['doc']
+        hash['doc'].delete('_id')
+        hash['doc'].delete('_rev') unless @keep_revision
+      end
     else
       hash['doc'] = line['doc']
       hash['@metadata']['action'] = 'update'
