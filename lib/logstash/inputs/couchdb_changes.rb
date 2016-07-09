@@ -68,6 +68,10 @@ class LogStash::Inputs::CouchDBChanges < LogStash::Inputs::Base
   # output.
   config :keep_revision, :validate => :boolean, :default => false
 
+  # Preserve the CouchDB document revision "_id" value in the
+  # output.
+  config :keep_id, :validate => :boolean, :default => false
+
   # Preserve the document contents in the output when "deleted"
   config :keep_deleted_doc, :validate => :boolean, :default => false
 
@@ -208,13 +212,13 @@ class LogStash::Inputs::CouchDBChanges < LogStash::Inputs::Base
       hash['@metadata']['action'] = 'delete'
       if @keep_deleted_doc
         hash['doc'] = line['doc']
-        hash['doc'].delete('_id')
+        hash['doc'].delete('_id') unless @keep_id
         hash['doc'].delete('_rev') unless @keep_revision
       end
     else
       hash['doc'] = line['doc']
       hash['@metadata']['action'] = 'update'
-      hash['doc'].delete('_id')
+      hash['doc'].delete('_id') unless @keep_id
       hash['doc_as_upsert'] = true
       hash['doc'].delete('_rev') unless @keep_revision
     end
