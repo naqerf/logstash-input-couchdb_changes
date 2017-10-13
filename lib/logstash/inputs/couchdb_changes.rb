@@ -64,6 +64,10 @@ class LogStash::Inputs::CouchDBChanges < LogStash::Inputs::Base
   # and that you will unset this value afterwards.
   config :initial_sequence, :validate => :number
 
+  # Preserve the CouchDB document id "_id" value in the
+  # output.
+  config :keep_id, :validate => :boolean, :default => false
+
   # Preserve the CouchDB document revision "_rev" value in the
   # output.
   config :keep_revision, :validate => :boolean, :default => false
@@ -119,7 +123,16 @@ class LogStash::Inputs::CouchDBChanges < LogStash::Inputs::Base
 
     @scheme = @secure ? 'https' : 'http'
 
-    @sequence = @initial_sequence ? @initial_sequence : @sequencedb.read
+    if !@initial_sequence.nil?
+      @logger.info("initial_sequence is set, writing to filesystem ...",
+                   :initial_sequence => @initial_sequence, :sequence_path => @sequence_path)
+      @sequencedb.write(@initial_sequence)
+      @sequence = @initial_sequence
+    else
+      @logger.info("No initial_sequence set, reading from filesystem ...",
+                   :sequence_path => @sequence_path)
+      @sequence = @sequencedb.read
+    end
 
   end
 
@@ -145,6 +158,7 @@ class LogStash::Inputs::CouchDBChanges < LogStash::Inputs::Base
     buffer = FileWatch::BufferedTokenizer.new
     @logger.info("Connecting to CouchDB _changes stream at:", :host => @host.to_s, :port => @port.to_s, :db => @db)
     uri = build_uri
+    @logger.info("Using service uri :", :uri => uri)
     until stop?
       begin
         Net::HTTP.start(@host, @port, :use_ssl => (@secure == true), :ca_file => @ca_file) do |http|
@@ -152,7 +166,10 @@ class LogStash::Inputs::CouchDBChanges < LogStash::Inputs::Base
           request = Net::HTTP::Get.new(uri.request_uri)
           request.basic_auth(@username, @password.value) if @username && @password
           http.request request do |response|
-            raise ArgumentError, "Database not found!" if response.code == "404"
+            raise ArgumentError, :message => "Server error!", :response_code => response.code if response.code >= "500"
+            raise ArgumentError, :message => "Authentication error!", :response_code => response.code if response.code == "401"
+            raise ArgumentError, :message => "Database not found!", :response_code => response.code if response.code == "404"
+            raise ArgumentError, :message => "Request error!", :response_code => response.code if response.code >= "400"
             response.read_body do |chunk|
               buffer.extract(chunk).each do |changes|
                 # Put a "stop" check here. If we stop here, anything we've read, but
@@ -167,7 +184,7 @@ class LogStash::Inputs::CouchDBChanges < LogStash::Inputs::Base
                   @logger.debug("event", :event => event.to_hash_with_metadata) if @logger.debug?
                   decorate(event)
                   queue << event
-                  @sequence = event['@metadata']['seq']
+                  @sequence = event.get("[@metadata][seq]")
                   @sequencedb.write(@sequence.to_s)
                 end
               end
@@ -175,8 +192,8 @@ class LogStash::Inputs::CouchDBChanges < LogStash::Inputs::Base
           end
         end
       rescue Timeout::Error, Errno::EINVAL, Errno::ECONNRESET, EOFError, Errno::EHOSTUNREACH, Errno::ECONNREFUSED,
-        Net::HTTPBadResponse, Net::HTTPHeaderSyntaxError, Net::ProtocolError => e
-        @logger.error("Connection problem encountered: Retrying connection in 10 seconds...", :error => e.to_s)
+        Net::HTTPBadResponse, Net::HTTPHeaderSyntaxError, Net::ProtocolError, SocketError => e
+        @logger.error("Connection problem encountered: Retrying connection in " + @reconnect_delay.to_s + " seconds...", :error => e.to_s, :host => @host.to_s, :port => @port.to_s, :db => @db)
         retry if reconnect?
       rescue Errno::EBADF => e
         @logger.error("Unable to connect: Bad file descriptor: ", :error => e.to_s)
@@ -197,18 +214,22 @@ class LogStash::Inputs::CouchDBChanges < LogStash::Inputs::Base
 
   private
   def reconnect?
-    Stud.stoppable_sleep(@connect_retry_interval) if @always_reconnect
+    Stud.stoppable_sleep(@reconnect_delay) if @always_reconnect
     @always_reconnect
   end
 
   private
-  def build_event(line)
+  def build_event(changes)
     # In lieu of a codec, build the event here
-    line = LogStash::Json.load(line)
-    return nil if line.has_key?("last_seq")
+    data = LogStash::Json.load(changes)
+    return nil if data.has_key?("last_seq")
+    if data['doc'].nil?
+      logger.debug("doc is nil", :data => data)
+      return nil
+    end
     hash = Hash.new
-    hash['@metadata'] = { '_id' => line['doc']['_id'] }
-    if line['doc']['_deleted']
+    hash['@metadata'] = { '_id' => data['doc']['_id'] }
+    if data['doc']['_deleted']
       hash['@metadata']['action'] = 'delete'
       if @keep_deleted_doc
         hash['doc'] = line['doc']
@@ -216,13 +237,13 @@ class LogStash::Inputs::CouchDBChanges < LogStash::Inputs::Base
         hash['doc'].delete('_rev') unless @keep_revision
       end
     else
-      hash['doc'] = line['doc']
+      hash['doc'] = data['doc']
       hash['@metadata']['action'] = 'update'
       hash['doc'].delete('_id') unless @keep_id
       hash['doc_as_upsert'] = true
       hash['doc'].delete('_rev') unless @keep_revision
     end
-    hash['@metadata']['seq'] = line['seq']
+    hash['@metadata']['seq'] = data['seq']
     event = LogStash::Event.new(hash)
     @logger.debug("event", :event => event.to_hash_with_metadata) if @logger.debug?
     event
